@@ -8,6 +8,8 @@
 #import <AVFoundation/AVFoundation.h>
 #import <Cocoa/Cocoa.h>
 #include "ImageSnap.h"
+#import "ExifContainer.h"
+#import "NSImage+Exif.h"
 
 #define error(...) fprintf(stderr, __VA_ARGS__)
 #define console(...) (!g_quiet && printf(__VA_ARGS__))
@@ -41,18 +43,9 @@ FOUNDATION_EXPORT NSString *const VERSION;
  */
 + (AVCaptureDevice *)deviceNamed:(NSString *)name;
 
-- (void)setUpSessionWithDevice:(AVCaptureDevice *)device;
-
-- (void)getReadyToTakePicture;
-
-/**
- * Primary one-stop-shopping message for capturing an image.
- * Activates the video source, saves a frame, stops the source,
- * and saves the file.
- */
-- (void)saveSingleSnapshotFrom:(AVCaptureDevice *)device
-                        toFile:(NSString *)path
++ (void)saveSingleSnapshotFrom:(AVCaptureDevice *)device
+                        toPath:(NSString *)path
                     withWarmup:(NSNumber *)warmup
-                 withTimelapse:(NSNumber *)timelapse;
+             withCallbackBlock:(void (^)(NSURL *imageURL, NSError *error))callbackBlock;
 
 @end

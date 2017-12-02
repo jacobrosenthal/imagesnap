@@ -19,37 +19,11 @@ NSString *const VERSION = @"0.2.5";
 @property (nonatomic, strong) AVCaptureStillImageOutput *captureStillImageOutput;
 @property (nonatomic, assign) CVImageBufferRef currentImageBuffer;
 @property (nonatomic, strong) AVCaptureConnection *videoConnection;
-@property (nonatomic, strong) NSDateFormatter *dateFormatter;
-
-#if OS_OBJECT_HAVE_OBJC_SUPPORT == 1
-@property (nonatomic, strong) dispatch_queue_t imageQueue;
-#else
-@property (nonatomic, assign) dispatch_queue_t imageQueue;
-#endif
 
 @end
 
 @implementation ImageSnap
 
-#pragma mark - Object Lifecycle
-
-- (instancetype)init {
-    self = [super init];
-
-    if (self) {
-        _dateFormatter = [NSDateFormatter new];
-        _dateFormatter.dateFormat = @"yyyy-MM-dd_HH-mm-ss.SSS";
-
-        _imageQueue = dispatch_queue_create("Image Queue", NULL);
-    }
-
-    return self;
-}
-
-- (void)dealloc {
-    [self.captureSession stopRunning];
-    CVBufferRelease(self.currentImageBuffer);
-}
 
 #pragma mark - Public Interface
 
@@ -95,142 +69,135 @@ NSString *const VERSION = @"0.2.5";
     return result;
 }
 
-- (void)saveSingleSnapshotFrom:(AVCaptureDevice *)device
-                        toFile:(NSString *)path
-                    withWarmup:(NSNumber *)warmup
-                 withTimelapse:(NSNumber *)timelapse {
++ (NSURL *)NSURLfromPath:(NSString *)path andDate:(NSDate *)now{
 
-    double interval = timelapse == nil ? -1 : timelapse.doubleValue;
+    NSDateFormatter *dateFormatter;
+    dateFormatter = [NSDateFormatter new];
+    dateFormatter.dateFormat = @"yyyy-MM-dd_HH-mm-ss.SSS";
+
+    NSString *nowstr = [dateFormatter stringFromDate:now];
+
+    NSString *pathAndFilename = [NSString stringWithFormat:@"%@%@%@", path, nowstr, @".jpg"];
+
+    return [NSURL fileURLWithPath:pathAndFilename isDirectory:NO];
+}
+
++ (void)saveSingleSnapshotFrom:(AVCaptureDevice *)device
+                        toPath:(NSString *)path
+                    withWarmup:(NSNumber *)warmup
+             withCallbackBlock:(void (^)(NSURL *imageURL, NSError *error))callbackBlock{
+
+    NSOperationQueue *queue = [NSOperationQueue new];
+    queue.maxConcurrentOperationCount =1;
+
+    NSDate *now = [NSDate date];
+    NSURL *imageURL = [self NSURLfromPath:path andDate:now];
 
     verbose("Starting device...");
+
+    NSError *error;
+    __block AVCaptureSession *captureSession;
+    __block AVCaptureDeviceInput *captureDeviceInput;
+    __block AVCaptureStillImageOutput *captureStillImageOutput;
+    AVCaptureConnection *videoConnection;
+
+    // Create the capture session
+    captureSession = [AVCaptureSession new];
+    if ([captureSession canSetSessionPreset:AVCaptureSessionPresetPhoto]) {
+        captureSession.sessionPreset = AVCaptureSessionPresetPhoto;
+    }
+
+    // Create input object from the device
+    captureDeviceInput = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
+    if (!error && [captureSession canAddInput:captureDeviceInput]) {
+        [captureSession addInput:captureDeviceInput];
+    }
+
+    captureStillImageOutput = [AVCaptureStillImageOutput new];
+    captureStillImageOutput.outputSettings = @{ AVVideoCodecKey : AVVideoCodecJPEG};
+
+    if ([captureSession canAddOutput:captureStillImageOutput]) {
+        [captureSession addOutput:captureStillImageOutput];
+    }
+
+    for (AVCaptureConnection *connection in captureStillImageOutput.connections) {
+        for (AVCaptureInputPort *port in [connection inputPorts]) {
+            if ([port.mediaType isEqual:AVMediaTypeVideo] ) {
+                videoConnection = connection;
+                break;
+            }
+        }
+        if (videoConnection) { break; }
+    }
+
+    if ([captureSession canAddOutput:captureStillImageOutput]) {
+        [captureSession addOutput:captureStillImageOutput];
+    }
+
+    [captureSession startRunning];
+
     verbose("Device started.\n");
+
+    void (^stopSession)(void) = ^void(void) {
+        verbose("Stopping session...\n");
+
+        // Make sure we've stopped
+        while (captureSession != nil) {
+            verbose("\tCaptureSession != nil\n");
+
+            verbose("\tStopping CaptureSession...");
+            [captureSession stopRunning];
+            verbose("Done.\n");
+
+            if ([captureSession isRunning]) {
+                verbose("[captureSession isRunning]");
+                [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+            } else {
+                verbose("\tShutting down 'stopSession(..)'" );
+
+                captureSession = nil;
+                captureDeviceInput = nil;
+                captureStillImageOutput = nil;
+            }
+        }
+    };
 
     if (warmup == nil) {
         // Skip warmup
         verbose("Skipping warmup period.\n");
     } else {
         double delay = warmup.doubleValue;
-        verbose("Delaying %.2lf seconds for warmup...", delay);
-        NSDate *now = [[NSDate alloc] init];
-        [[NSRunLoop currentRunLoop] runUntilDate:[now dateByAddingTimeInterval:warmup.doubleValue]];
+        verbose("Delaying %.2lf seconds for warmup...\n", delay);
+        [NSThread sleepForTimeInterval:[warmup floatValue]];
         verbose("Warmup complete.\n");
     }
 
-    if (interval > 0) {
-        verbose("Time lapse: snapping every %.2lf seconds to current directory.\n", interval);
+    void(^saveImage)(CMSampleBufferRef imageDataSampleBuffer, NSError *error) = ^void(CMSampleBufferRef imageDataSampleBuffer, NSError *error) {
 
-        for (unsigned long seq = 0; ; seq++) {
-
-            // capture and write
-            [self takeSnapshotWithFilename:[self fileNameWithSequenceNumber:seq]];                // Capture a frame
-
-            // sleep
-            [[NSRunLoop currentRunLoop] runUntilDate:[[NSDate date] dateByAddingTimeInterval:interval]];
+        // usually happens if you close lid while its grabbing a photos
+        if(error){
+            [queue addOperationWithBlock:stopSession];
+            callbackBlock(NULL, error);
+            return;
         }
 
-    } else {
-        [self takeSnapshotWithFilename:[self fileNameWithSequenceNumber:0]];                // Capture a frame
-    }
+        verbose("Making exif data");
+        ExifContainer *container = [[ExifContainer alloc] init];
+        [container addCreationDate:now];
+        [container addDigitizedDate:now];
 
-    [self stopSession];
-}
+        NSData *rawImageData = [AVCaptureStillImageOutput jpegStillImageNSDataRepresentation:imageDataSampleBuffer];
+        NSData *imageData = [NSImage getAppendedDataForImageData:rawImageData exif:container];
 
-- (void)setUpSessionWithDevice:(AVCaptureDevice *)device {
+        [queue addOperationWithBlock:^void(void) {
+            [imageData writeToURL:imageURL atomically:YES];
+        }];
+        [queue addOperationWithBlock:stopSession];
+        callbackBlock(imageURL, error);
+    };
 
-    NSError *error;
-
-    // Create the capture session
-    self.captureSession = [AVCaptureSession new];
-    if ([self.captureSession canSetSessionPreset:AVCaptureSessionPresetPhoto]) {
-        self.captureSession.sessionPreset = AVCaptureSessionPresetPhoto;
-    }
-
-    // Create input object from the device
-    self.captureDeviceInput = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
-    if (!error && [self.captureSession canAddInput:self.captureDeviceInput]) {
-        [self.captureSession addInput:self.captureDeviceInput];
-    }
-
-    self.captureStillImageOutput = [AVCaptureStillImageOutput new];
-    self.captureStillImageOutput.outputSettings = @{ AVVideoCodecKey : AVVideoCodecJPEG};
-
-    if ([self.captureSession canAddOutput:self.captureStillImageOutput]) {
-        [self.captureSession addOutput:self.captureStillImageOutput];
-    }
-
-    for (AVCaptureConnection *connection in self.captureStillImageOutput.connections) {
-        for (AVCaptureInputPort *port in [connection inputPorts]) {
-            if ([port.mediaType isEqual:AVMediaTypeVideo] ) {
-                self.videoConnection = connection;
-                break;
-            }
-        }
-        if (self.videoConnection) { break; }
-    }
-
-    if ([self.captureSession canAddOutput:self.captureStillImageOutput]) {
-        [self.captureSession addOutput:self.captureStillImageOutput];
-    }
-}
-
-- (void)getReadyToTakePicture {
-    [self.captureSession startRunning];
-}
-
-#pragma mark - Internal Methods
-
-/**
- * Returns current snapshot or nil if there is a problem
- * or session is not started.
- */
-- (void)takeSnapshotWithFilename:(NSString *)filename {
-    __weak __typeof__(filename) weakFilename = filename;
-
-    [self.captureStillImageOutput captureStillImageAsynchronouslyFromConnection:self.videoConnection
-                                                              completionHandler:
-     ^(CMSampleBufferRef imageDataSampleBuffer, NSError *error) {
-
-         NSData *imageData = [AVCaptureStillImageOutput jpegStillImageNSDataRepresentation:imageDataSampleBuffer];
-
-         dispatch_async(self.imageQueue, ^{
-             [imageData writeToFile:weakFilename atomically:YES];
-         });
-     }];
-}
-
-/**
- * Blocks until session is stopped.
- */
-- (void)stopSession {
-    verbose("Stopping session...\n" );
-
-    // Make sure we've stopped
-    while (self.captureSession != nil) {
-        verbose("\tCaptureSession != nil\n");
-
-        verbose("\tStopping CaptureSession...");
-        [self.captureSession stopRunning];
-        verbose("Done.\n");
-
-        if ([self.captureSession isRunning]) {
-            verbose("[captureSession isRunning]");
-            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-        } else {
-            verbose("\tShutting down 'stopSession(..)'" );
-
-            self.captureSession = nil;
-            self.captureDeviceInput = nil;
-            self.captureStillImageOutput = nil;
-        }
-    }
-}
-
-- (NSString *)fileNameWithSequenceNumber:(unsigned long)sequenceNumber {
-
-    NSDate *now = [NSDate date];
-    NSString *nowstr = [self.dateFormatter stringFromDate:now];
-
-    return [NSString stringWithFormat:@"snapshot-%05lu-%s.jpg", sequenceNumber, nowstr.UTF8String];
+    [captureStillImageOutput captureStillImageAsynchronouslyFromConnection:videoConnection
+                                                         completionHandler:saveImage];
 }
 
 @end
